@@ -19,7 +19,6 @@ type ConversionResult struct {
 	Errors          []string
 }
 
-// TableTestConverter converts slice-based table tests to map-based table tests
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: go run tabletests.go <directory_path>")
@@ -61,6 +60,8 @@ func ConvertTableTests(directory string) (ConversionResult, error) {
 			return nil
 		}
 
+		fmt.Printf("Processing file: %s\n", path)
+
 		// Process Go file
 		fileResult, err := processFile(path)
 		if err != nil {
@@ -72,6 +73,7 @@ func ConvertTableTests(directory string) (ConversionResult, error) {
 		if fileResult.Modified {
 			result.FilesModified++
 			result.TablesConverted += fileResult.TablesConverted
+			fmt.Printf("Modified file: %s, Tables converted: %d\n", path, fileResult.TablesConverted)
 		}
 
 		return nil
@@ -104,167 +106,150 @@ func processFile(filePath string) (FileResult, error) {
 	// Find and convert table tests
 	modified := false
 	tablesConverted := 0
-
+	
+	// First, identify all table test variables
+	tableTestVars := make(map[string]bool)
+	
+	// Step 1: Find all slice of struct declarations (table tests)
 	ast.Inspect(node, func(n ast.Node) bool {
-		// Look for variable declarations
-		decl, ok := n.(*ast.GenDecl)
-		if !ok || decl.Tok != token.VAR && decl.Tok != token.CONST {
-			return true
-		}
-
-		// Process each spec in the declaration
-		for _, spec := range decl.Specs {
-			valueSpec, ok := spec.(*ast.ValueSpec)
-			if !ok {
-				continue
+		// Look for assignment statements like 'tests := []struct{ ... }{ ... }'
+		if assign, ok := n.(*ast.AssignStmt); ok {
+			// Only interested in := or = assignments
+			if assign.Tok != token.DEFINE && assign.Tok != token.ASSIGN {
+				return true
 			}
-
-			// Check if the declaration is a potential table test
-			for i, value := range valueSpec.Values {
-				// We're looking for a slice of struct literals
-				arrayType, ok := valueSpec.Type.(*ast.ArrayType)
+			
+			// Check each right-hand side value
+			for i, rhs := range assign.Rhs {
+				// Check if it's a composite literal
+				compLit, ok := rhs.(*ast.CompositeLit)
 				if !ok {
 					continue
 				}
-
-				// Check if it's a slice (no length specified)
+				
+				// Check if it's a slice of structs
+				arrayType, ok := compLit.Type.(*ast.ArrayType)
+				if !ok {
+					continue
+				}
+				
+				// Check if it's a slice (no length)
 				if arrayType.Len != nil {
 					continue
 				}
-
-				// Check if it's a struct type
+				
+				// Check if element type is a struct
 				structType, ok := arrayType.Elt.(*ast.StructType)
 				if !ok {
 					continue
 				}
-
-				// Find the name field (usually first field)
+				
+				// Check for name/description field
 				nameField, nameFieldIndex := findNameField(structType)
 				if nameField == "" {
 					continue
 				}
-
-				// Convert the slice expression to a map expression
-				compLit, ok := value.(*ast.CompositeLit)
-				if !ok {
-					continue
+				
+				// Found a table test - get the variable name
+				if i < len(assign.Lhs) {
+					if ident, ok := assign.Lhs[i].(*ast.Ident); ok {
+						tableTestVars[ident.Name] = true
+						fmt.Printf("Found table test variable: %s\n", ident.Name)
+						
+						// Convert the slice of structs to a map
+						mapType := &ast.MapType{
+							Key:   &ast.Ident{Name: "string"},
+							Value: createStructTypeWithoutField(structType, nameFieldIndex),
+						}
+						
+						// Create new map entries from the slice elements
+						entries := make([]ast.Expr, 0, len(compLit.Elts))
+						for _, elt := range compLit.Elts {
+							if sliceElt, ok := elt.(*ast.CompositeLit); ok && nameFieldIndex < len(sliceElt.Elts) {
+								// Extract name field value for map key
+								var nameValue ast.Expr
+								if basicLit, ok := sliceElt.Elts[nameFieldIndex].(*ast.BasicLit); ok {
+									nameValue = basicLit
+								} else {
+									continue
+								}
+								
+								// Create a new struct literal without the name field
+								newElts := make([]ast.Expr, 0, len(sliceElt.Elts)-1)
+								for j, val := range sliceElt.Elts {
+									if j != nameFieldIndex {
+										newElts = append(newElts, val)
+									}
+								}
+								
+								// Create map entry
+								entry := &ast.KeyValueExpr{
+									Key:   nameValue,
+									Value: &ast.CompositeLit{Elts: newElts},
+								}
+								
+								entries = append(entries, entry)
+							}
+						}
+						
+						// Replace the original slice with the new map
+						compLit.Type = mapType
+						compLit.Elts = entries
+						
+						modified = true
+						tablesConverted++
+					}
 				}
-
-				// Convert to map-based table test
-				mapType := &ast.MapType{
-					Key:   &ast.Ident{Name: "string"},
-					Value: structType,
-				}
-
-				// Create a new struct type without the name field
-				newStructType := createStructTypeWithoutField(structType, nameFieldIndex)
-
-				// Create new map composite literal
-				newCompLit := &ast.CompositeLit{
-					Type: mapType,
-					Elts: convertElementsToMapEntries(compLit.Elts, nameFieldIndex),
-				}
-
-				// Update the AST
-				valueSpec.Type = mapType
-				valueSpec.Values[i] = newCompLit
-				arrayType.Elt = newStructType
-
-				modified = true
-				tablesConverted++
 			}
 		}
-
+		
 		return true
 	})
-
-	// Update loops where the table tests are used
+	
+	// Step 2: Update range loops over table tests
 	ast.Inspect(node, func(n ast.Node) bool {
-		// Look for range statements
-		rangeStmt, ok := n.(*ast.RangeStmt)
-		if !ok {
-			return true
-		}
-
-		// Check if this is a range over a variable (potential table test)
-		ident, ok := rangeStmt.X.(*ast.Ident)
-		if !ok {
-			return true
-		}
-
-		// Find declarations to determine if this is a table test
-		obj := lookupObject(node, ident.Name)
-		if obj == nil {
-			return true
-		}
-
-		// Check if it's a map type
-		if isMapType(obj) {
-			// Update loop variables
-			// For map based tests: for name, tc := range tests
-			if rangeStmt.Key != nil && rangeStmt.Value != nil {
-				// Already has both key and value - no need to change
-				return true
+		if rangeStmt, ok := n.(*ast.RangeStmt); ok {
+			// Check if the range is over a table test variable
+			if ident, ok := rangeStmt.X.(*ast.Ident); ok && tableTestVars[ident.Name] {
+				fmt.Printf("Found range over table test: %s\n", ident.Name)
+				
+				// Update loop variables for map-based iteration
+				// Change from: for _, tc := range tests
+				// To:         for name, tc := range tests
+				if isBlankIdent(rangeStmt.Key) || rangeStmt.Key == nil {
+					rangeStmt.Key = &ast.Ident{Name: "name"}
+					modified = true
+				}
 			}
-
-			// If only using index (for i := range tests)
-			// or if only using value (for _, tc := range tests),
-			// update to use both name and value
-			if isBlankIdent(rangeStmt.Key) || rangeStmt.Key == nil {
-				// Create a new key identifier "name"
-				rangeStmt.Key = &ast.Ident{Name: "name"}
-			}
-
-			modified = true
 		}
-
+		
 		return true
 	})
-
-	// Also update t.Run calls to use 'name' instead of 'tc.name'
+	
+	// Step 3: Update t.Run calls and other references to use the map key instead of tc.name/tc.desc
 	ast.Inspect(node, func(n ast.Node) bool {
-		// Look for t.Run calls
-		callExpr, ok := n.(*ast.CallExpr)
-		if !ok {
-			return true
+		if callExpr, ok := n.(*ast.CallExpr); ok {
+			// Check if it's a t.Run call
+			if selectorExpr, ok := callExpr.Fun.(*ast.SelectorExpr); ok {
+				if ident, ok := selectorExpr.X.(*ast.Ident); ok && ident.Name == "t" && selectorExpr.Sel.Name == "Run" {
+					// Check if the first argument is tc.name
+					if len(callExpr.Args) > 0 {
+						if arg, ok := callExpr.Args[0].(*ast.SelectorExpr); ok {
+							if x, ok := arg.X.(*ast.Ident); ok && x.Name == "tc" && 
+							   (arg.Sel.Name == "name" || arg.Sel.Name == "desc" || arg.Sel.Name == "description") {
+								// Replace tc.name with name
+								callExpr.Args[0] = &ast.Ident{Name: "name"}
+								modified = true
+							}
+						}
+					}
+				}
+			}
 		}
-
-		// Check if it's a t.Run call
-		selectorExpr, ok := callExpr.Fun.(*ast.SelectorExpr)
-		if !ok {
-			return true
-		}
-
-		receiverIdent, ok := selectorExpr.X.(*ast.Ident)
-		if !ok || receiverIdent.Name != "t" || selectorExpr.Sel.Name != "Run" {
-			return true
-		}
-
-		// Check first argument - should be tc.name
-		if len(callExpr.Args) < 1 {
-			return true
-		}
-
-		// Check if the first argument is tc.name
-		arg0, ok := callExpr.Args[0].(*ast.SelectorExpr)
-		if !ok {
-			return true
-		}
-
-		x, ok := arg0.X.(*ast.Ident)
-		if !ok {
-			return true
-		}
-
-		// If it's tc.name, replace with just "name"
-		if x.Name == "tc" && arg0.Sel.Name == "name" {
-			callExpr.Args[0] = &ast.Ident{Name: "name"}
-			modified = true
-		}
-
+		
 		return true
 	})
-
+	
 	if modified {
 		// Write the modified AST back to the file
 		f, err := os.Create(filePath)
@@ -272,37 +257,38 @@ func processFile(filePath string) (FileResult, error) {
 			return result, fmt.Errorf("error creating file: %v", err)
 		}
 		defer f.Close()
-
+		
 		err = printer.Fprint(f, fset, node)
 		if err != nil {
 			return result, fmt.Errorf("error writing to file: %v", err)
 		}
-
+		
 		result.Modified = true
 		result.TablesConverted = tablesConverted
 	}
-
+	
 	return result, nil
 }
 
 // findNameField tries to find the name field in a struct type
 func findNameField(structType *ast.StructType) (string, int) {
 	if structType.Fields == nil || structType.Fields.List == nil {
+		fmt.Println("Struct has no fields")
 		return "", -1
 	}
-
-	// Check for name field (usually first field)
+	
+	// Check for name field
 	for i, field := range structType.Fields.List {
 		if len(field.Names) == 0 {
 			continue
 		}
-
+		
 		fieldName := field.Names[0].Name
 		if fieldName == "name" || fieldName == "desc" || fieldName == "description" {
 			return fieldName, i
 		}
 	}
-
+	
 	return "", -1
 }
 
@@ -311,104 +297,20 @@ func createStructTypeWithoutField(structType *ast.StructType, fieldIndex int) *a
 	if fieldIndex < 0 {
 		return structType
 	}
-
+	
 	newFields := &ast.FieldList{
 		List: make([]*ast.Field, 0, len(structType.Fields.List)-1),
 	}
-
+	
 	for i, field := range structType.Fields.List {
 		if i != fieldIndex {
 			newFields.List = append(newFields.List, field)
 		}
 	}
-
+	
 	return &ast.StructType{
 		Fields: newFields,
 	}
-}
-
-// convertElementsToMapEntries converts slice elements to map entries
-func convertElementsToMapEntries(elements []ast.Expr, nameFieldIndex int) []ast.Expr {
-	if nameFieldIndex < 0 {
-		return elements
-	}
-
-	newElements := make([]ast.Expr, 0, len(elements))
-
-	for _, elt := range elements {
-		compLit, ok := elt.(*ast.CompositeLit)
-		if !ok || nameFieldIndex >= len(compLit.Elts) {
-			continue
-		}
-
-		// Extract the name value to be used as key
-		var nameValue string
-		if basicLit, ok := compLit.Elts[nameFieldIndex].(*ast.BasicLit); ok {
-			nameValue = basicLit.Value
-		} else {
-			// Skip if cannot determine name
-			continue
-		}
-
-		// Create a new composite literal without the name field
-		newElts := make([]ast.Expr, 0, len(compLit.Elts)-1)
-		for i, fieldValue := range compLit.Elts {
-			if i != nameFieldIndex {
-				newElts = append(newElts, fieldValue)
-			}
-		}
-
-		// Create a new key-value entry
-		newElement := &ast.KeyValueExpr{
-			Key:   &ast.BasicLit{Kind: token.STRING, Value: nameValue},
-			Value: &ast.CompositeLit{Elts: newElts},
-		}
-
-		newElements = append(newElements, newElement)
-	}
-
-	return newElements
-}
-
-// lookupObject finds the declaration of a variable
-func lookupObject(file *ast.File, name string) *ast.Object {
-	for _, decl := range file.Decls {
-		genDecl, ok := decl.(*ast.GenDecl)
-		if !ok || genDecl.Tok != token.VAR && genDecl.Tok != token.CONST {
-			continue
-		}
-
-		for _, spec := range genDecl.Specs {
-			valueSpec, ok := spec.(*ast.ValueSpec)
-			if !ok {
-				continue
-			}
-
-			for _, ident := range valueSpec.Names {
-				if ident.Name == name {
-					return ident.Obj
-				}
-			}
-		}
-	}
-
-	return nil
-}
-
-// isMapType checks if a variable is a map type
-func isMapType(obj *ast.Object) bool {
-	if obj == nil || obj.Decl == nil {
-		return false
-	}
-
-	spec, ok := obj.Decl.(*ast.ValueSpec)
-	if !ok {
-		return false
-	}
-
-	// Check if the type is a map
-	_, ok = spec.Type.(*ast.MapType)
-	return ok
 }
 
 // isBlankIdent checks if an expression is a blank identifier (_)
